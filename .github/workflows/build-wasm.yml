@@ -163,5 +163,5 @@ jobs:
             Updates SQLite Wasm binaries from ref `${{ steps.resolve-ref.outputs.sqlite_ref }}` (commit `${{ steps.resolve-ref.outputs.sqlite_sha }}`).
             Bare-bones: ${{ github.event.inputs.bare_bones }}
           branch: ${{ steps.resolve-ref.outputs.branch_name }}
-          base: main
+          base: master
           delete-branch: true
