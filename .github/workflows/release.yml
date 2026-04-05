@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/node-setup
+      - run: npm run build
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '25'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm publish
+
+  github-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Generate release notes
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+
+          SQLITE_VERSION=$(grep "SQLITE_VERSION = " src/version.ts | sed "s/.*'\(.*\)'/\1/")
+          SQLITE_REF=$(grep "SQLITE_REF = " src/version.ts | sed "s/.*'\(.*\)'/\1/")
+          BUILD_VARIANT=$(grep "BUILD_VARIANT = " src/version.ts | sed "s/.*'\(.*\)'/\1/")
+
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${TAG}$" | head -n1)
+
+          if [ -n "$PREV_TAG" ]; then
+            CHANGES=$(git log "${PREV_TAG}..${TAG}" --pretty=format:"- %s" --no-merges)
+          else
+            CHANGES=$(git log "${TAG}" --pretty=format:"- %s" --no-merges)
+          fi
+
+          cat > /tmp/release-notes.md <<EOF
+          Built from SQLite ${SQLITE_VERSION} (ref: ${SQLITE_REF}) with ${BUILD_VARIANT} build variant.
+
+          Upstream: https://github.com/sqlite/sqlite
+
+          ## Changes
+
+          ${CHANGES}
+          EOF
+          sed -i 's/^          //' /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file /tmp/release-notes.md

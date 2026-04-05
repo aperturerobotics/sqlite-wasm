@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SQLITE_REPO="${SQLITE_REPO:-https://github.com/sqlite/sqlite.git}"
+SQLITE_REPO="${SQLITE_REPO:-https://github.com/aperturerobotics/sqlite.git}"
 SQLITE_REF="${SQLITE_REF:-master}"
+SQLITE_BARE_BONES="${SQLITE_BARE_BONES:-1}"
 OUT_DIR="${OUT_DIR:-/out}"
 SRC_DIR="${WORKDIR:-/build/sqlite-src}"
 HOST_UID="${HOST_UID:-}"
@@ -86,7 +87,7 @@ if [ -f /emsdk/emsdk_env.sh ]; then
   # shellcheck disable=SC1091
   source /emsdk/emsdk_env.sh
 else
-  log "Warning: /emsdk/emsdk_env.sh not found — emscripten environment not available"
+  log "Warning: /emsdk/emsdk_env.sh not found, emscripten environment not available"
 fi
 
 # build steps
@@ -106,8 +107,13 @@ make sqlite3.c
 
 cd ext/wasm
 
-log "Running make -j4 npm (ext/wasm)"
-make -j4 npm
+MAKE_ARGS="npm"
+if [ "$SQLITE_BARE_BONES" = "1" ]; then
+  log "Building with bare-bones options (reduced size, no FTS5/RTREE/JSON/WAL)"
+  MAKE_ARGS="wasm-bare-bones=1 $MAKE_ARGS"
+fi
+log "Running make -j4 $MAKE_ARGS (ext/wasm)"
+make -j4 $MAKE_ARGS
 
 # ensure artifact exists
 if [ ! -f npm-bundle.zip ]; then

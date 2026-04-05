@@ -7,14 +7,22 @@ on:
         description: 'SQLite reference (tag, branch, or commit, or "latest")'
         required: true
         default: 'master'
+      bare_bones:
+        description: 'Build with bare-bones options (reduced size)'
+        required: true
+        default: '1'
 
 permissions:
   contents: write
   pull-requests: write
 
+env:
+  EMSDK_VERSION: '5.0.5'
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -25,22 +33,19 @@ jobs:
         id: resolve-ref
         run: |
           SQLITE_REF="${{ github.event.inputs.sqlite_ref }}"
+          SQLITE_UPSTREAM="https://github.com/sqlite/sqlite.git"
           if [ "$SQLITE_REF" = "latest" ]; then
             echo "Fetching latest tag..."
-            LATEST_TAG=$(git ls-remote --tags --sort="v:refname" https://github.com/sqlite/sqlite.git "refs/tags/version-*" | tail -n 1 | cut -f 2 | sed 's/refs\/tags\///')
+            LATEST_TAG=$(git ls-remote --tags --sort="v:refname" "$SQLITE_UPSTREAM" "refs/tags/version-*" | tail -n 1 | cut -f 2 | sed 's/refs\/tags\///')
             echo "Latest tag found: $LATEST_TAG"
             SQLITE_REF="$LATEST_TAG"
           fi
 
-          # Get the full commit SHA
-          SQLITE_SHA=$(git ls-remote https://github.com/sqlite/sqlite.git "$SQLITE_REF" | head -n 1 | cut -f 1)
+          SQLITE_SHA=$(git ls-remote "$SQLITE_UPSTREAM" "$SQLITE_REF" | head -n 1 | cut -f 1)
           if [ -z "$SQLITE_SHA" ]; then
-            # If not found, maybe it's a tag that needs refs/tags/ prefix or it's already a SHA
-            SQLITE_SHA=$(git ls-remote https://github.com/sqlite/sqlite.git "refs/tags/$SQLITE_REF" | head -n 1 | cut -f 1)
+            SQLITE_SHA=$(git ls-remote "$SQLITE_UPSTREAM" "refs/tags/$SQLITE_REF" | head -n 1 | cut -f 1)
           fi
-
           if [ -z "$SQLITE_SHA" ]; then
-            # Fallback: assume it's a SHA if ls-remote didn't find it as a ref
             SQLITE_SHA="$SQLITE_REF"
           fi
 
@@ -59,39 +64,79 @@ jobs:
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Set up Buildx Docker CLI plugin
-        if: steps.check-branch.outputs.skip != 'true'
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
-        if: steps.check-branch.outputs.skip != 'true'
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          load: true
-          tags: sqlite-wasm-builder:env
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Run build
+      - name: Install build dependencies
         if: steps.check-branch.outputs.skip != 'true'
         run: |
-          mkdir -p out src/bin
-          docker run --rm \
-            -e SQLITE_REF="${{ steps.resolve-ref.outputs.sqlite_ref }}" \
-            -e HOST_UID="$(id -u)" \
-            -e HOST_GID="$(id -g)" \
-            -v "$(pwd)/out":/out \
-            -v "$(pwd)/src/bin":/src/bin \
-            sqlite-wasm-builder:env build
-          # Fallback fix for permissions if chown inside docker failed or was incomplete
-          sudo chown -R $(id -u):$(id -g) out src/bin
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool m4 wabt
+
+      - name: Cache emsdk
+        if: steps.check-branch.outputs.skip != 'true'
+        id: cache-emsdk
+        uses: actions/cache@v4
+        with:
+          path: emsdk
+          key: emsdk-${{ env.EMSDK_VERSION }}-${{ runner.os }}
+
+      - name: Install emsdk
+        if:
+          steps.check-branch.outputs.skip != 'true' &&
+          steps.cache-emsdk.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/emscripten-core/emsdk.git
+          ./emsdk/emsdk install ${{ env.EMSDK_VERSION }}
+
+      - name: Activate emsdk
+        if: steps.check-branch.outputs.skip != 'true'
+        run: |
+          ./emsdk/emsdk activate ${{ env.EMSDK_VERSION }}
+          source ./emsdk/emsdk_env.sh
+          echo "$EMSDK/upstream/emscripten" >> "$GITHUB_PATH"
+          echo "EMSDK=$EMSDK" >> "$GITHUB_ENV"
+          echo "EM_CONFIG=$EM_CONFIG" >> "$GITHUB_ENV"
+
+      - name: Clone SQLite source
+        if: steps.check-branch.outputs.skip != 'true'
+        run: |
+          SQLITE_REF="${{ steps.resolve-ref.outputs.sqlite_ref }}"
+          git clone --depth 1 --branch "$SQLITE_REF" \
+            https://github.com/aperturerobotics/sqlite.git /tmp/sqlite-src || \
+          git clone https://github.com/aperturerobotics/sqlite.git /tmp/sqlite-src && \
+          git -C /tmp/sqlite-src checkout "$SQLITE_REF"
+
+      - name: Build SQLite Wasm
+        if: steps.check-branch.outputs.skip != 'true'
+        run: |
+          cd /tmp/sqlite-src
+          autoreconf -f -i
+          ./configure
+          make sqlite3.c
+          cd ext/wasm
+          BARE_BONES="${{ github.event.inputs.bare_bones }}"
+          MAKE_ARGS="npm"
+          if [ "$BARE_BONES" = "1" ]; then
+            MAKE_ARGS="wasm-bare-bones=1 $MAKE_ARGS"
+          fi
+          make -j$(nproc) $MAKE_ARGS
+
+      - name: Extract build artifacts
+        if: steps.check-branch.outputs.skip != 'true'
+        run: |
+          rm -rf src/bin/*
+          unzip -q -o /tmp/sqlite-src/ext/wasm/npm-bundle.zip -d src/bin
+          shopt -s nullglob
+          entries=(src/bin/*)
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            mv "${entries[0]}"/* src/bin/
+            rmdir "${entries[0]}"
+          fi
+          shopt -u nullglob
 
       - name: Check for changes
         if: steps.check-branch.outputs.skip != 'true'
         id: git-check
         run: |
-          # Add files that might be newly created or modified
           git add src/bin
           git status --porcelain
           if [ -n "$(git status --porcelain)" ]; then
@@ -115,9 +160,8 @@ jobs:
             'chore: update SQLite Wasm binaries from ${{
             steps.resolve-ref.outputs.sqlite_ref }}'
           body: |
-            This PR updates the SQLite Wasm binaries in `src/bin` by building them from SQLite reference `${{ steps.resolve-ref.outputs.sqlite_ref }}` (commit `${{ steps.resolve-ref.outputs.sqlite_sha }}`).
-
-            Triggered by manual workflow dispatch.
+            Updates SQLite Wasm binaries from ref `${{ steps.resolve-ref.outputs.sqlite_ref }}` (commit `${{ steps.resolve-ref.outputs.sqlite_sha }}`).
+            Bare-bones: ${{ github.event.inputs.bare_bones }}
           branch: ${{ steps.resolve-ref.outputs.branch_name }}
           base: main
           delete-branch: true
